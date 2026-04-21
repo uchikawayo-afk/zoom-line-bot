@@ -144,7 +144,7 @@ def reply_text(reply_token: str, text: str) -> None:
         )
 
 
-@app.route("/callback", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
