@@ -163,7 +163,7 @@ def handle_message(event):
     if dt is None:
         reply_text(
             event.reply_token,
-            "日時を認識できませんでした。\n"
+            "日時を認識できませんでした.\n"
             "以下の形式で入力してください:\n"
             "- 4/30 18時から\n"
             "- 明日 15時から\n"
@@ -174,7 +174,7 @@ def handle_message(event):
     try:
         meeting = create_zoom_meeting(dt)
         join_url = meeting["join_url"]
-        start_fmt = dt.strftime("%Y年%m月%d日 %H:%M")
+        start_fmt = dt.strftime("%Y/%m/%d %H:%M")
         reply_text(
             event.reply_token,
             f"Zoomミーティングを作成しました\n\n"
@@ -184,10 +184,10 @@ def handle_message(event):
     except requests.HTTPError as e:
         reply_text(
             event.reply_token,
-            f"Zoomミーティングの作成に失敗しました。\nエラー: {e.response.status_code} {e.response.text}",
+            f"Zoomミーティングの作成に失敗しました.\nエラー: {e.response.status_code} {e.response.text}",
         )
     except Exception as e:
-        reply_text(event.reply_token, f"エラーが発生しました。\n{str(e)}")
+        reply_text(event.reply_token, f"エラーが発生しました.\n{str(e)}")
 
 
 if __name__ == "__main__":
