@@ -164,10 +164,10 @@ def handle_message(event):
         reply_text(
             event.reply_token,
             "日時を認識できませんでした。\n"
-            "以下の形式で入力してください：\n"
-            "・「4/30 18時から」\n"
-            "・「明日 15時から」\n"
-            "・「今日 20時30分から」",
+            "以下の形式で入力してください:\n"
+            "- 4/30 18時から\n"
+            "- 明日 15時から\n"
+            "- 今日 20時30分から",
         )
         return
 
@@ -177,9 +177,9 @@ def handle_message(event):
         start_fmt = dt.strftime("%Y年%m月%d日 %H:%M")
         reply_text(
             event.reply_token,
-            f"Zoomミーティングを作成しました！\n\n"
-            f"📅 開始: {start_fmt}\n"
-            f"🔗 {join_url}",
+            f"Zoomミーティングを作成しました\n\n"
+            f"開始: {start_fmt}\n"
+            f"URL: {join_url}",
         )
     except requests.HTTPError as e:
         reply_text(
