@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -36,6 +37,16 @@ LINE_CHANNEL_ACCESS_TOKEN = sanitize_env(os.getenv("LINE_CHANNEL_ACCESS_TOKEN", 
 ZOOM_ACCOUNT_ID = sanitize_env(os.getenv("ZOOM_ACCOUNT_ID", ""))
 ZOOM_CLIENT_ID = sanitize_env(os.getenv("ZOOM_CLIENT_ID", ""))
 ZOOM_CLIENT_SECRET = sanitize_env(os.getenv("ZOOM_CLIENT_SECRET", ""))
+
+# マルチユーザーZoom認証情報 (JSONパース失敗時は空辞書で続行)
+_raw_creds = os.getenv("USER_ZOOM_CREDENTIALS", "")
+try:
+    USER_ZOOM_CREDENTIALS: dict = json.loads(_raw_creds) if _raw_creds else {}
+    if USER_ZOOM_CREDENTIALS:
+        logger.info(f"Loaded Zoom credentials for {len(USER_ZOOM_CREDENTIALS)} user(s)")
+except (json.JSONDecodeError, TypeError) as e:
+    logger.error(f"USER_ZOOM_CREDENTIALS parse error: {e}")
+    USER_ZOOM_CREDENTIALS = {}
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -105,18 +116,31 @@ def parse_datetime(text: str) -> datetime | None:
     return None
 
 
-def get_zoom_access_token() -> str:
+def get_zoom_credentials(user_id: str) -> tuple[str, str, str] | None:
+    """ユーザー別のZoom認証情報を取得。未登録ならNone"""
+    creds = USER_ZOOM_CREDENTIALS.get(user_id)
+    if creds:
+        return creds["account_id"], creds["client_id"], creds["client_secret"]
+    return None
+
+
+def get_zoom_access_token(user_id: str = "") -> str:
+    creds = get_zoom_credentials(user_id) if user_id else None
+    if creds:
+        account_id, client_id, client_secret = creds
+    else:
+        account_id, client_id, client_secret = ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET
     url = (
         f"https://zoom.us/oauth/token"
-        f"?grant_type=account_credentials&account_id={ZOOM_ACCOUNT_ID}"
+        f"?grant_type=account_credentials&account_id={account_id}"
     )
-    resp = requests.post(url, auth=(ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET), timeout=10)
+    resp = requests.post(url, auth=(client_id, client_secret), timeout=10)
     resp.raise_for_status()
     return resp.json()["access_token"]
 
 
-def create_zoom_meeting(start_time: datetime, duration: int = 60) -> dict:
-    token = get_zoom_access_token()
+def create_zoom_meeting(start_time: datetime, user_id: str = "", duration: int = 60) -> dict:
+    token = get_zoom_access_token(user_id)
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -170,6 +194,22 @@ def callback():
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     text = event.message.text.strip()
+    user_id = event.source.user_id
+
+    # /whoami コマンド
+    if text.lower() in ("/whoami", "whoami"):
+        reply_text(event.reply_token, f"あなたのuser_id:\n{user_id}")
+        return
+
+    # 未登録ユーザーチェック (USER_ZOOM_CREDENTIALSが設定されている場合のみ)
+    if USER_ZOOM_CREDENTIALS and user_id not in USER_ZOOM_CREDENTIALS:
+        has_fallback = all([ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET])
+        if not has_fallback:
+            reply_text(
+                event.reply_token,
+                f"未登録のユーザーです. 管理者に連絡してください.\nあなたのuser_id: {user_id}",
+            )
+            return
 
     dt = parse_datetime(text)
     if dt is None:
@@ -184,12 +224,17 @@ def handle_message(event):
         return
 
     try:
-        meeting = create_zoom_meeting(dt)
+        meeting = create_zoom_meeting(dt, user_id=user_id)
         join_url = meeting["join_url"]
         start_fmt = dt.strftime("%Y/%m/%d %H:%M")
+        # ユーザー名があれば表示
+        creds = USER_ZOOM_CREDENTIALS.get(user_id, {})
+        name = creds.get("name", "")
+        name_line = f"作成者: {name}\n" if name else ""
         reply_text(
             event.reply_token,
             f"Zoomミーティングを作成しました\n\n"
+            f"{name_line}"
             f"開始: {start_fmt}\n"
             f"URL: {join_url}",
         )
