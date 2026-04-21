@@ -6,9 +6,16 @@ import pytz
 import requests
 from dotenv import load_dotenv
 from flask import Flask, abort, request
-from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.v3 import WebhookHandler
+from linebot.v3.exceptions import InvalidSignatureError
+from linebot.v3.messaging import (
+    ApiClient,
+    Configuration,
+    MessagingApi,
+    ReplyMessageRequest,
+    TextMessage,
+)
+from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
 load_dotenv()
 
@@ -20,7 +27,7 @@ ZOOM_ACCOUNT_ID = os.getenv("ZOOM_ACCOUNT_ID")
 ZOOM_CLIENT_ID = os.getenv("ZOOM_CLIENT_ID")
 ZOOM_CLIENT_SECRET = os.getenv("ZOOM_CLIENT_SECRET")
 
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 JST = pytz.timezone("Asia/Tokyo")
@@ -127,6 +134,16 @@ def create_zoom_meeting(start_time: datetime, duration: int = 60) -> dict:
     return resp.json()
 
 
+def reply_text(reply_token: str, text: str) -> None:
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).reply_message(
+            ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=[TextMessage(text=text)],
+            )
+        )
+
+
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
@@ -138,37 +155,39 @@ def callback():
     return "OK"
 
 
-@handler.add(MessageEvent, message=TextMessage)
+@handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     text = event.message.text.strip()
 
     dt = parse_datetime(text)
     if dt is None:
-        reply = (
+        reply_text(
+            event.reply_token,
             "日時を認識できませんでした。\n"
             "以下の形式で入力してください：\n"
             "・「4/30 18時から」\n"
             "・「明日 15時から」\n"
-            "・「今日 20時30分から」"
+            "・「今日 20時30分から」",
         )
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
     try:
         meeting = create_zoom_meeting(dt)
         join_url = meeting["join_url"]
         start_fmt = dt.strftime("%Y年%m月%d日 %H:%M")
-        reply = (
+        reply_text(
+            event.reply_token,
             f"Zoomミーティングを作成しました！\n\n"
             f"📅 開始: {start_fmt}\n"
-            f"🔗 {join_url}"
+            f"🔗 {join_url}",
         )
     except requests.HTTPError as e:
-        reply = f"Zoomミーティングの作成に失敗しました。\nエラー: {e.response.status_code} {e.response.text}"
+        reply_text(
+            event.reply_token,
+            f"Zoomミーティングの作成に失敗しました。\nエラー: {e.response.status_code} {e.response.text}",
+        )
     except Exception as e:
-        reply = f"エラーが発生しました。\n{str(e)}"
-
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        reply_text(event.reply_token, f"エラーが発生しました。\n{str(e)}")
 
 
 if __name__ == "__main__":
