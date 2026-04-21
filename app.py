@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 from datetime import datetime, timedelta
@@ -19,13 +20,22 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
 
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-ZOOM_ACCOUNT_ID = os.getenv("ZOOM_ACCOUNT_ID")
-ZOOM_CLIENT_ID = os.getenv("ZOOM_CLIENT_ID")
-ZOOM_CLIENT_SECRET = os.getenv("ZOOM_CLIENT_SECRET")
+
+def sanitize_env(value: str) -> str:
+    """環境変数からASCII以外の文字と前後の空白を除去"""
+    return value.strip().encode("ascii", errors="ignore").decode("ascii")
+
+
+LINE_CHANNEL_SECRET = sanitize_env(os.getenv("LINE_CHANNEL_SECRET", ""))
+LINE_CHANNEL_ACCESS_TOKEN = sanitize_env(os.getenv("LINE_CHANNEL_ACCESS_TOKEN", ""))
+ZOOM_ACCOUNT_ID = sanitize_env(os.getenv("ZOOM_ACCOUNT_ID", ""))
+ZOOM_CLIENT_ID = sanitize_env(os.getenv("ZOOM_CLIENT_ID", ""))
+ZOOM_CLIENT_SECRET = sanitize_env(os.getenv("ZOOM_CLIENT_SECRET", ""))
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -135,6 +145,8 @@ def create_zoom_meeting(start_time: datetime, duration: int = 60) -> dict:
 
 
 def reply_text(reply_token: str, text: str) -> None:
+    logger.info(f"Reply token: {repr(reply_token)}")
+    logger.info(f"Message text: {repr(text)}")
     with ApiClient(configuration) as api_client:
         MessagingApi(api_client).reply_message(
             ReplyMessageRequest(
