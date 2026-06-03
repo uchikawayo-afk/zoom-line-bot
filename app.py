@@ -1,3 +1,6 @@
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -8,16 +11,6 @@ import pytz
 import requests
 from dotenv import load_dotenv
 from flask import Flask, abort, request
-from linebot.v3 import WebhookHandler
-from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.messaging import (
-    ApiClient,
-    Configuration,
-    MessagingApi,
-    ReplyMessageRequest,
-    TextMessage,
-)
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
 load_dotenv()
 
@@ -48,10 +41,9 @@ except (json.JSONDecodeError, TypeError) as e:
     logger.error(f"USER_ZOOM_CREDENTIALS parse error: {e}")
     USER_ZOOM_CREDENTIALS = {}
 
-configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
-
 JST = pytz.timezone("Asia/Tokyo")
+
+LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 
 
 def parse_datetime(text: str) -> datetime | None:
@@ -168,37 +160,62 @@ def create_zoom_meeting(start_time: datetime, user_id: str = "", duration: int =
     return resp.json()
 
 
+def validate_signature(body: str, signature: str) -> bool:
+    """LINE Messaging API の X-Line-Signature を hmac-sha256 で検証"""
+    digest = hmac.new(
+        LINE_CHANNEL_SECRET.encode("utf-8"),
+        body.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    expected = base64.b64encode(digest).decode("utf-8")
+    return hmac.compare_digest(expected, signature)
+
+
 def reply_text(reply_token: str, text: str) -> None:
+    """requestsでLINE Messaging APIに直接返信。本文は明示的にUTF-8で送る"""
     logger.info(f"Reply token: {repr(reply_token)}")
     logger.info(f"Message text: {repr(text)}")
-    with ApiClient(configuration) as api_client:
-        MessagingApi(api_client).reply_message(
-            ReplyMessageRequest(
-                reply_token=reply_token,
-                messages=[TextMessage(text=text)],
-            )
-        )
+    payload = {
+        "replyToken": reply_token,
+        "messages": [{"type": "text", "text": text}],
+    }
+    resp = requests.post(
+        LINE_REPLY_URL,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        },
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        logger.error(f"LINE reply failed: {resp.status_code} {resp.text}")
 
 
 @app.route("/webhook", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
+    if not validate_signature(body, signature):
         abort(400)
+    try:
+        events = json.loads(body).get("events", [])
+    except json.JSONDecodeError:
+        abort(400)
+    for event in events:
+        if event.get("type") == "message" and event.get("message", {}).get("type") == "text":
+            handle_message(event)
     return "OK"
 
 
-@handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
-    text = event.message.text.strip()
-    user_id = event.source.user_id
+    text = event["message"]["text"].strip()
+    user_id = event["source"].get("user_id") or event["source"].get("userId", "")
+    reply_token = event["replyToken"]
 
     # /whoami コマンド
     if text.lower() in ("/whoami", "whoami"):
-        reply_text(event.reply_token, f"あなたのuser_id:\n{user_id}")
+        reply_text(reply_token, f"あなたのuser_id:\n{user_id}")
         return
 
     # 未登録ユーザーチェック (USER_ZOOM_CREDENTIALSが設定されている場合のみ)
@@ -206,7 +223,7 @@ def handle_message(event):
         has_fallback = all([ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET])
         if not has_fallback:
             reply_text(
-                event.reply_token,
+                reply_token,
                 f"未登録のユーザーです. 管理者に連絡してください.\nあなたのuser_id: {user_id}",
             )
             return
@@ -214,7 +231,7 @@ def handle_message(event):
     dt = parse_datetime(text)
     if dt is None:
         reply_text(
-            event.reply_token,
+            reply_token,
             "日時を認識できませんでした.\n"
             "以下の形式で入力してください:\n"
             "- 4/30 18時から\n"
@@ -232,7 +249,7 @@ def handle_message(event):
         name = creds.get("name", "")
         name_line = f"作成者: {name}\n" if name else ""
         reply_text(
-            event.reply_token,
+            reply_token,
             f"Zoomミーティングを作成しました\n\n"
             f"{name_line}"
             f"開始: {start_fmt}\n"
@@ -240,11 +257,11 @@ def handle_message(event):
         )
     except requests.HTTPError as e:
         reply_text(
-            event.reply_token,
+            reply_token,
             f"Zoomミーティングの作成に失敗しました.\nエラー: {e.response.status_code} {e.response.text}",
         )
     except Exception as e:
-        reply_text(event.reply_token, f"エラーが発生しました.\n{str(e)}")
+        reply_text(reply_token, f"エラーが発生しました.\n{str(e)}")
 
 
 if __name__ == "__main__":
