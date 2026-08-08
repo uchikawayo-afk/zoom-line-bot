@@ -27,6 +27,13 @@ def sanitize_env(value: str) -> str:
 
 LINE_CHANNEL_SECRET = sanitize_env(os.getenv("LINE_CHANNEL_SECRET", ""))
 LINE_CHANNEL_ACCESS_TOKEN = sanitize_env(os.getenv("LINE_CHANNEL_ACCESS_TOKEN", ""))
+# 日報「再送」用：ad-dashboardに保存された最新の日報本文を取り出すエンドポイント
+DAILY_REPORT_LATEST_URL = sanitize_env(os.getenv(
+    "DAILY_REPORT_LATEST_URL",
+    "https://ad-dashboard-27531714336.asia-northeast1.run.app/api/daily-report/latest",
+))
+DAILY_REPORT_SECRET = sanitize_env(os.getenv("DAILY_REPORT_SECRET", ""))
+RESEND_KEYWORDS = ("再送", "日報", "日報再送", "にっぽう")
 ZOOM_ACCOUNT_ID = sanitize_env(os.getenv("ZOOM_ACCOUNT_ID", ""))
 ZOOM_CLIENT_ID = sanitize_env(os.getenv("ZOOM_CLIENT_ID", ""))
 ZOOM_CLIENT_SECRET = sanitize_env(os.getenv("ZOOM_CLIENT_SECRET", ""))
@@ -208,6 +215,30 @@ def callback():
     return "OK"
 
 
+def resend_daily_report() -> str:
+    """ad-dashboard から最新の日報本文を取得して返す。取得失敗時は理由を返す。
+    Macが寝ていても、直前に生成・送信済みの日報ならこのクラウド保存から再送できる。"""
+    if not DAILY_REPORT_SECRET:
+        return "日報の再送設定が未完了です（DAILY_REPORT_SECRET未設定）。管理者に連絡してください。"
+    try:
+        resp = requests.get(
+            DAILY_REPORT_LATEST_URL,
+            headers={"Authorization": f"Bearer {DAILY_REPORT_SECRET}"},
+            timeout=15,
+        )
+    except Exception as e:
+        return f"日報の取得に失敗しました（通信エラー）。\n{e}"
+    if resp.status_code == 404:
+        return "まだ日報が作成されていません（就寝中で未生成の可能性）。Macを開けると生成されます。"
+    if resp.status_code != 200:
+        return f"日報の取得に失敗しました（HTTP {resp.status_code}）。"
+    body = (resp.json() or {}).get("body", "")
+    if not body:
+        return "日報の本文が空でした。"
+    # LINE 1メッセージ上限5000字。まず入らない長さの日報はほぼ無いが保険で切る。
+    return body if len(body) <= 4900 else body[:4900] + "\n…（以下省略）"
+
+
 def handle_message(event):
     text = event["message"]["text"].strip()
     user_id = event["source"].get("user_id") or event["source"].get("userId", "")
@@ -216,6 +247,11 @@ def handle_message(event):
     # /whoami コマンド
     if text.lower() in ("/whoami", "whoami"):
         reply_text(reply_token, f"あなたのuser_id:\n{user_id}")
+        return
+
+    # 「再送」：ad-dashboardに保存された最新の日報本文をもう一度返す
+    if text in RESEND_KEYWORDS:
+        reply_text(reply_token, resend_daily_report())
         return
 
     # 未登録ユーザーチェック (USER_ZOOM_CREDENTIALSが設定されている場合のみ)
