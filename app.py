@@ -51,6 +51,7 @@ except (json.JSONDecodeError, TypeError) as e:
 JST = pytz.timezone("Asia/Tokyo")
 
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
+APP_VERSION = "2026-08-17-group-id"
 
 
 def parse_datetime(text: str) -> datetime | None:
@@ -199,6 +200,12 @@ def reply_text(reply_token: str, text: str) -> None:
         logger.error(f"LINE reply failed: {resp.status_code} {resp.text}")
 
 
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    """デプロイ確認用。GROUP_ID_CMD対応版が乗っていれば version が返る。"""
+    return {"ok": True, "version": APP_VERSION}
+
+
 @app.route("/webhook", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
@@ -210,9 +217,37 @@ def callback():
     except json.JSONDecodeError:
         abort(400)
     for event in events:
-        if event.get("type") == "message" and event.get("message", {}).get("type") == "text":
+        etype = event.get("type")
+        if etype == "join":
+            handle_join(event)
+        elif etype == "message" and event.get("message", {}).get("type") == "text":
             handle_message(event)
     return "OK"
+
+
+def source_ids(event) -> tuple[str, str, str]:
+    """(source_type, group_or_room_id, user_id) を返す。camelCase/snake_case両対応。"""
+    src = event.get("source", {})
+    stype = src.get("type", "")
+    gid = (
+        src.get("groupId") or src.get("group_id")
+        or src.get("roomId") or src.get("room_id") or ""
+    )
+    uid = src.get("userId") or src.get("user_id") or ""
+    return stype, gid, uid
+
+
+def handle_join(event):
+    """グループ/複数人トークに招待されたとき、通知先IDをその場で返す。"""
+    stype, gid, _ = source_ids(event)
+    logger.info(f"join event: type={stype} id={gid}")
+    reply_text(
+        event["replyToken"],
+        "通知用botを追加いただきありがとうございます。\n"
+        f"このトークの通知先ID（{stype}Id）:\n{gid}\n\n"
+        "※このIDを通知システム側に設定すると、ここに通知が届くようになります。\n"
+        "※このトーク内では /id 以外のメッセージには反応しません。",
+    )
 
 
 def resend_daily_report() -> str:
@@ -241,12 +276,23 @@ def resend_daily_report() -> str:
 
 def handle_message(event):
     text = event["message"]["text"].strip()
-    user_id = event["source"].get("user_id") or event["source"].get("userId", "")
+    source_type, group_id, user_id = source_ids(event)
     reply_token = event["replyToken"]
 
-    # /whoami コマンド
-    if text.lower() in ("/whoami", "whoami"):
-        reply_text(reply_token, f"あなたのuser_id:\n{user_id}")
+    # /whoami・/id コマンド（グループでは通知先IDも返す）
+    if text.lower() in ("/whoami", "whoami", "/id", "id"):
+        if source_type in ("group", "room"):
+            reply_text(
+                reply_token,
+                f"このトークの通知先ID（{source_type}Id）:\n{group_id}\n\n"
+                f"あなたのuser_id:\n{user_id}",
+            )
+        else:
+            reply_text(reply_token, f"あなたのuser_id:\n{user_id}")
+        return
+
+    # グループ/複数人トークでは /id 以外に反応しない（会話を邪魔しない）
+    if source_type in ("group", "room"):
         return
 
     # 「再送」：ad-dashboardに保存された最新の日報本文をもう一度返す
