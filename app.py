@@ -51,7 +51,7 @@ except (json.JSONDecodeError, TypeError) as e:
 JST = pytz.timezone("Asia/Tokyo")
 
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
-APP_VERSION = "2026-08-17-group-id"
+APP_VERSION = "2026-08-17-last-group"
 
 
 def parse_datetime(text: str) -> datetime | None:
@@ -206,6 +206,28 @@ def healthz():
     return {"ok": True, "version": APP_VERSION}
 
 
+# 直近に見たグループ/複数人トークのID（通知先の設定用。プロセス再起動で消える）
+SEEN_SOURCES: list[dict] = []
+
+
+def remember_source(stype: str, sid: str, event_type: str) -> None:
+    if not sid:
+        return
+    SEEN_SOURCES[:] = [s for s in SEEN_SOURCES if s["id"] != sid]
+    SEEN_SOURCES.insert(0, {"type": stype, "id": sid, "event": event_type})
+    del SEEN_SOURCES[5:]
+    logger.info(f"source seen: {stype} {sid} ({event_type})")
+
+
+@app.route("/last-group", methods=["GET"])
+def last_group():
+    """招待直後に通知先IDを拾うための口。?k=<LAST_GROUP_KEY> が必要。"""
+    key = sanitize_env(os.getenv("LAST_GROUP_KEY", "sponsor-setup"))
+    if request.args.get("k", "") != key:
+        abort(404)
+    return {"sources": SEEN_SOURCES}
+
+
 @app.route("/webhook", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
@@ -218,6 +240,9 @@ def callback():
         abort(400)
     for event in events:
         etype = event.get("type")
+        stype, gid, _ = source_ids(event)
+        if stype in ("group", "room"):
+            remember_source(stype, gid, etype)
         if etype == "join":
             handle_join(event)
         elif etype == "message" and event.get("message", {}).get("type") == "text":
