@@ -1,18 +1,17 @@
 import base64
+import datetime as dt
 import hashlib
 import hmac
 import json
 import logging
 import os
-import re
-from datetime import datetime, timedelta
+import zoneinfo
 
-import pytz
 import requests
-from dotenv import load_dotenv
 from flask import Flask, abort, request
 
-load_dotenv()
+import availability
+import parsing
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -27,18 +26,18 @@ def sanitize_env(value: str) -> str:
 
 LINE_CHANNEL_SECRET = sanitize_env(os.getenv("LINE_CHANNEL_SECRET", ""))
 LINE_CHANNEL_ACCESS_TOKEN = sanitize_env(os.getenv("LINE_CHANNEL_ACCESS_TOKEN", ""))
-# 日報「再送」用：ad-dashboardに保存された最新の日報本文を取り出すエンドポイント
 DAILY_REPORT_LATEST_URL = sanitize_env(os.getenv(
     "DAILY_REPORT_LATEST_URL",
     "https://ad-dashboard-27531714336.asia-northeast1.run.app/api/daily-report/latest",
 ))
 DAILY_REPORT_SECRET = sanitize_env(os.getenv("DAILY_REPORT_SECRET", ""))
 RESEND_KEYWORDS = ("再送", "日報", "日報再送", "にっぽう")
+HELP_KEYWORDS = ("ヘルプ", "help", "使い方", "つかいかた", "?", "？")
+AVAILABILITY_KEYWORDS = ("空き", "あき", "空", "予定", "空き時間", "空いてる")
 ZOOM_ACCOUNT_ID = sanitize_env(os.getenv("ZOOM_ACCOUNT_ID", ""))
 ZOOM_CLIENT_ID = sanitize_env(os.getenv("ZOOM_CLIENT_ID", ""))
 ZOOM_CLIENT_SECRET = sanitize_env(os.getenv("ZOOM_CLIENT_SECRET", ""))
 
-# マルチユーザーZoom認証情報 (JSONパース失敗時は空辞書で続行)
 _raw_creds = os.getenv("USER_ZOOM_CREDENTIALS", "")
 try:
     USER_ZOOM_CREDENTIALS: dict = json.loads(_raw_creds) if _raw_creds else {}
@@ -48,72 +47,34 @@ except (json.JSONDecodeError, TypeError) as e:
     logger.error(f"USER_ZOOM_CREDENTIALS parse error: {e}")
     USER_ZOOM_CREDENTIALS = {}
 
-JST = pytz.timezone("Asia/Tokyo")
-
+JST = zoneinfo.ZoneInfo("Asia/Tokyo")
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
-APP_VERSION = "2026-08-17-last-group"
+LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
+APP_VERSION = "2026-08-24-cloudrun-calendar"
 
-
-def parse_datetime(text: str) -> datetime | None:
-    """
-    日本語テキストから日時を解析する。
-    対応パターン例:
-      - 「4/30 18時から」
-      - 「4/30 18:30」
-      - 「明日 15時から」
-      - 「今日 20時30分から」
-      - 「30日 18時」
-    """
-    now = datetime.now(JST)
-
-    # パターン1: 月/日 時 (例: 4/30 18時, 4/30 18時30分, 4/30 18:30)
-    m = re.search(
-        r"(\d{1,2})/(\d{1,2})\s*[^\d]*?(\d{1,2})(?:時|:)(?:(\d{2})分?)?",
-        text,
-    )
-    if m:
-        month, day, hour = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        minute = int(m.group(4)) if m.group(4) else 0
-        year = now.year
-        try:
-            dt = JST.localize(datetime(year, month, day, hour, minute))
-            if dt < now:
-                dt = JST.localize(datetime(year + 1, month, day, hour, minute))
-            return dt
-        except ValueError:
-            return None
-
-    # パターン2: 明日 時 (例: 明日 18時, 明日18時30分)
-    m = re.search(r"明日\s*(\d{1,2})時(?:(\d{2})分)?", text)
-    if m:
-        hour = int(m.group(1))
-        minute = int(m.group(2)) if m.group(2) else 0
-        tomorrow = now + timedelta(days=1)
-        return JST.localize(datetime(tomorrow.year, tomorrow.month, tomorrow.day, hour, minute))
-
-    # パターン3: 今日 時 (例: 今日 20時, 今日20時30分)
-    m = re.search(r"今日\s*(\d{1,2})時(?:(\d{2})分)?", text)
-    if m:
-        hour = int(m.group(1))
-        minute = int(m.group(2)) if m.group(2) else 0
-        return JST.localize(datetime(now.year, now.month, now.day, hour, minute))
-
-    # パターン4: 日 時 (例: 30日 18時, 30日18時30分)
-    m = re.search(r"(\d{1,2})日\s*(\d{1,2})時(?:(\d{2})分)?", text)
-    if m:
-        day, hour = int(m.group(1)), int(m.group(2))
-        minute = int(m.group(3)) if m.group(3) else 0
-        try:
-            dt = JST.localize(datetime(now.year, now.month, day, hour, minute))
-            if dt < now:
-                next_month = now.month % 12 + 1
-                next_year = now.year + (1 if now.month == 12 else 0)
-                dt = JST.localize(datetime(next_year, next_month, day, hour, minute))
-            return dt
-        except ValueError:
-            return None
-
-    return None
+HELP_TEXT = (
+    "できること\n"
+    "\n"
+    "■ Zoomリンクを作る\n"
+    "日時を送るだけです。\n"
+    "・8/25 14時から\n"
+    "・明日 15時 90分\n"
+    "・来週火曜 14時半\n"
+    "・今日 20:30\n"
+    "所要時間を書かなければ60分になります。\n"
+    "\n"
+    "■ 空いている日程を出す\n"
+    "・空き　　　　→ 今日から1週間\n"
+    "・空き 来週\n"
+    "・空き 今週 10-18　→ 10〜18時スタートで探す\n"
+    "・空き 90分\n"
+    "そのまま相手に送れる候補文で返します。\n"
+    "「空き 詳しく」で日ごとの空き帯を全部出します。\n"
+    "\n"
+    "■ その他\n"
+    "・再送　→ 最新の日報をもう一度\n"
+    "・/id　 → user_id / groupId"
+)
 
 
 def get_zoom_credentials(user_id: str) -> tuple[str, str, str] | None:
@@ -134,17 +95,13 @@ def get_zoom_access_token(user_id: str = "") -> str:
         f"https://zoom.us/oauth/token"
         f"?grant_type=account_credentials&account_id={account_id}"
     )
-    resp = requests.post(url, auth=(client_id, client_secret), timeout=10)
+    resp = requests.post(url, auth=(client_id, client_secret), timeout=8)
     resp.raise_for_status()
     return resp.json()["access_token"]
 
 
-def create_zoom_meeting(start_time: datetime, user_id: str = "", duration: int = 60) -> dict:
+def create_zoom_meeting(start_time: dt.datetime, user_id: str = "", duration: int = 60) -> dict:
     token = get_zoom_access_token(user_id)
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
     payload = {
         "topic": "LINEから作成したミーティング",
         "type": 2,  # スケジュールミーティング
@@ -161,8 +118,8 @@ def create_zoom_meeting(start_time: datetime, user_id: str = "", duration: int =
     resp = requests.post(
         "https://api.zoom.us/v2/users/me/meetings",
         json=payload,
-        headers=headers,
-        timeout=10,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        timeout=8,
     )
     resp.raise_for_status()
     return resp.json()
@@ -179,16 +136,9 @@ def validate_signature(body: str, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
-def reply_text(reply_token: str, text: str) -> None:
-    """requestsでLINE Messaging APIに直接返信。本文は明示的にUTF-8で送る"""
-    logger.info(f"Reply token: {repr(reply_token)}")
-    logger.info(f"Message text: {repr(text)}")
-    payload = {
-        "replyToken": reply_token,
-        "messages": [{"type": "text", "text": text}],
-    }
-    resp = requests.post(
-        LINE_REPLY_URL,
+def _line_post(url: str, payload: dict) -> requests.Response:
+    return requests.post(
+        url,
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
@@ -196,13 +146,28 @@ def reply_text(reply_token: str, text: str) -> None:
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         timeout=10,
     )
-    if resp.status_code != 200:
-        logger.error(f"LINE reply failed: {resp.status_code} {resp.text}")
+
+
+def reply_text(reply_token: str, text: str, user_id: str = "") -> None:
+    """まずreplyで返し、replyTokenが切れていたらpushで送り直す。
+
+    コールドスタートや外部API待ちでreplyTokenが失効しても無言にならないようにする。
+    """
+    messages = [{"type": "text", "text": text}]
+    resp = _line_post(LINE_REPLY_URL, {"replyToken": reply_token, "messages": messages})
+    if resp.status_code == 200:
+        return
+    logger.error(f"LINE reply failed: {resp.status_code} {resp.text}")
+    if user_id:
+        push = _line_post(LINE_PUSH_URL, {"to": user_id, "messages": messages})
+        if push.status_code != 200:
+            logger.error(f"LINE push failed: {push.status_code} {push.text}")
+        else:
+            logger.info("recovered via push")
 
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
-    """デプロイ確認用。GROUP_ID_CMD対応版が乗っていれば version が返る。"""
     return {"ok": True, "version": APP_VERSION}
 
 
@@ -243,10 +208,14 @@ def callback():
         stype, gid, _ = source_ids(event)
         if stype in ("group", "room"):
             remember_source(stype, gid, etype)
-        if etype == "join":
-            handle_join(event)
-        elif etype == "message" and event.get("message", {}).get("type") == "text":
-            handle_message(event)
+        try:
+            if etype == "join":
+                handle_join(event)
+            elif etype == "message" and event.get("message", {}).get("type") == "text":
+                handle_message(event)
+        except Exception:
+            # 1件の失敗で残りのイベントを落とさない
+            logger.exception("event handling failed")
     return "OK"
 
 
@@ -276,8 +245,7 @@ def handle_join(event):
 
 
 def resend_daily_report() -> str:
-    """ad-dashboard から最新の日報本文を取得して返す。取得失敗時は理由を返す。
-    Macが寝ていても、直前に生成・送信済みの日報ならこのクラウド保存から再送できる。"""
+    """ad-dashboard から最新の日報本文を取得して返す。取得失敗時は理由を返す。"""
     if not DAILY_REPORT_SECRET:
         return "日報の再送設定が未完了です（DAILY_REPORT_SECRET未設定）。管理者に連絡してください。"
     try:
@@ -295,8 +263,33 @@ def resend_daily_report() -> str:
     body = (resp.json() or {}).get("body", "")
     if not body:
         return "日報の本文が空でした。"
-    # LINE 1メッセージ上限5000字。まず入らない長さの日報はほぼ無いが保険で切る。
     return body if len(body) <= 4900 else body[:4900] + "\n…（以下省略）"
+
+
+def handle_availability(text: str) -> str:
+    d0, d1, first, last, mins = parsing.parse_availability(text)
+    try:
+        if any(k in text for k in ("詳しく", "詳細", "全部", "一覧")):
+            head = (f"{d0.month}/{d0.day}〜{d1.month}/{d1.day}　"
+                    f"{first.strftime('%H:%M')}〜{last.strftime('%H:%M')}スタート／{mins}分\n\n")
+            return head + availability.detail_text(d0, d1, first, last, mins)
+        return availability.suggest_text(d0, d1, first, last, mins)
+    except availability.CalendarUnavailable as e:
+        return str(e)
+    except Exception as e:
+        logger.exception("availability failed")
+        return f"カレンダーの取得に失敗しました。\n{e}"
+
+
+def day_slots_text(day: dt.date) -> str:
+    """日付だけ送られたとき、その日の空きを返す。"""
+    try:
+        detail = availability.detail_text(day, day, dt.time(9, 0), dt.time(20, 0), 60)
+    except Exception:
+        return ""
+    return (f"{day.month}/{day.day} の空き（9:00〜20:00スタート／60分）\n{detail}\n\n"
+            "時刻まで送っていただければZoomを作ります（例: "
+            f"{day.month}/{day.day} 14時）")
 
 
 def handle_message(event):
@@ -304,71 +297,67 @@ def handle_message(event):
     source_type, group_id, user_id = source_ids(event)
     reply_token = event["replyToken"]
 
-    # /whoami・/id コマンド（グループでは通知先IDも返す）
+    def say(msg: str) -> None:
+        reply_text(reply_token, msg, user_id=user_id if source_type == "user" else "")
+
     if text.lower() in ("/whoami", "whoami", "/id", "id"):
         if source_type in ("group", "room"):
-            reply_text(
-                reply_token,
-                f"このトークの通知先ID（{source_type}Id）:\n{group_id}\n\n"
-                f"あなたのuser_id:\n{user_id}",
-            )
+            say(f"このトークの通知先ID（{source_type}Id）:\n{group_id}\n\n"
+                f"あなたのuser_id:\n{user_id}")
         else:
-            reply_text(reply_token, f"あなたのuser_id:\n{user_id}")
+            say(f"あなたのuser_id:\n{user_id}")
         return
 
     # グループ/複数人トークでは /id 以外に反応しない（会話を邪魔しない）
     if source_type in ("group", "room"):
         return
 
-    # 「再送」：ad-dashboardに保存された最新の日報本文をもう一度返す
-    if text in RESEND_KEYWORDS:
-        reply_text(reply_token, resend_daily_report())
+    if text.lower() in HELP_KEYWORDS:
+        say(HELP_TEXT)
         return
 
-    # 未登録ユーザーチェック (USER_ZOOM_CREDENTIALSが設定されている場合のみ)
+    if text in RESEND_KEYWORDS:
+        say(resend_daily_report())
+        return
+
+    if any(text.startswith(k) for k in AVAILABILITY_KEYWORDS):
+        say(handle_availability(text))
+        return
+
+    parsed = parsing.parse_request(text)
+    if parsed is None:
+        # 日付だけ送られた場合は、その日の空きを返して次の一手を示す
+        day = parsing.parse_date_only(text)
+        if day is not None:
+            hint = day_slots_text(day)
+            if hint:
+                say(hint)
+                return
+        say("日時を認識できませんでした。\n\n" + HELP_TEXT)
+        return
+
+    start, duration = parsed
     if USER_ZOOM_CREDENTIALS and user_id not in USER_ZOOM_CREDENTIALS:
-        has_fallback = all([ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET])
-        if not has_fallback:
-            reply_text(
-                reply_token,
-                f"未登録のユーザーです. 管理者に連絡してください.\nあなたのuser_id: {user_id}",
-            )
+        if not all([ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET]):
+            say(f"未登録のユーザーです。管理者に連絡してください。\nあなたのuser_id: {user_id}")
             return
 
-    dt = parse_datetime(text)
-    if dt is None:
-        reply_text(
-            reply_token,
-            "日時を認識できませんでした.\n"
-            "以下の形式で入力してください:\n"
-            "- 4/30 18時から\n"
-            "- 明日 15時から\n"
-            "- 今日 20時30分から",
-        )
-        return
-
     try:
-        meeting = create_zoom_meeting(dt, user_id=user_id)
-        join_url = meeting["join_url"]
-        start_fmt = dt.strftime("%Y/%m/%d %H:%M")
-        # ユーザー名があれば表示
-        creds = USER_ZOOM_CREDENTIALS.get(user_id, {})
-        name = creds.get("name", "")
+        meeting = create_zoom_meeting(start, user_id=user_id, duration=duration)
+        name = USER_ZOOM_CREDENTIALS.get(user_id, {}).get("name", "")
         name_line = f"作成者: {name}\n" if name else ""
-        reply_text(
-            reply_token,
-            f"Zoomミーティングを作成しました\n\n"
+        wd = "月火水木金土日"[start.weekday()]
+        say(f"Zoomミーティングを作成しました\n\n"
             f"{name_line}"
-            f"開始: {start_fmt}\n"
-            f"URL: {join_url}",
-        )
+            f"開始: {start.strftime('%Y/%m/%d')}({wd}) {start.strftime('%H:%M')}〜"
+            f"（{duration}分）\n"
+            f"URL: {meeting['join_url']}")
     except requests.HTTPError as e:
-        reply_text(
-            reply_token,
-            f"Zoomミーティングの作成に失敗しました.\nエラー: {e.response.status_code} {e.response.text}",
-        )
+        say(f"Zoomミーティングの作成に失敗しました。\n"
+            f"エラー: {e.response.status_code} {e.response.text[:300]}")
     except Exception as e:
-        reply_text(reply_token, f"エラーが発生しました.\n{str(e)}")
+        logger.exception("zoom creation failed")
+        say(f"エラーが発生しました。\n{e}")
 
 
 if __name__ == "__main__":
