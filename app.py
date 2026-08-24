@@ -166,6 +166,8 @@ def reply_text(reply_token: str, text: str, user_id: str = "") -> None:
             logger.info("recovered via push")
 
 
+# /healthz は run.app のフロントエンドに横取りされてアプリまで届かないため /health を使う
+@app.route("/health", methods=["GET"])
 @app.route("/healthz", methods=["GET"])
 def healthz():
     return {"ok": True, "version": APP_VERSION}
